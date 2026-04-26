@@ -1,5 +1,9 @@
 const { randomUUID } = require("crypto");
 
+// Maximum number of bytes accepted from a single WebSocket message.
+// Guards against memory-exhaustion from oversized payloads.
+const MAX_MESSAGE_BYTES = 64 * 1024; // 64 KB
+
 class Component {
   constructor(sdk) {
     this.id = randomUUID();
@@ -59,7 +63,11 @@ class Component {
   // Sends the buffered prop diff and exits update mode.
   flush() {
     if (this._updatePending !== null) {
-      this.sdk._send({ type: "update", id: this.id, props: this._updatePending });
+      this.sdk._send({ 
+        type: "update", 
+        id: this.id, 
+        props: this._updatePending 
+      });
       Object.assign(this._props, this._updatePending);
       this._updatePending = null;
     }
@@ -71,7 +79,9 @@ class Component {
     this.sdk._send({
       type: "create",
       id: this.id,
-      kind: this.constructor.name,
+      // Use the static `kind` property rather than `constructor.name` so the
+      // value survives minification and is explicitly declared per subclass.
+      kind: this.constructor.kind,
       props: { ...this._props },
       events: Object.keys(this._eventHandlers),
       children: this._children.map((c) => c.id),
@@ -94,24 +104,28 @@ class Component {
 }
 
 class Button extends Component {
+  static kind = "Button";
   text(val) {
     return this._setProp("text", val);
   }
 }
 
 class Text extends Component {
+  static kind = "Text";
   text(val) {
     return this._setProp("text", val);
   }
 }
 
-class Container extends Component {}
+class Container extends Component {
+  static kind = "Container";
+}
 
 class Input extends Component {
+  static kind = "Input";
   placeholder(val) {
     return this._setProp("placeholder", val);
   }
-
   value(val) {
     return this._setProp("value", val);
   }
@@ -126,15 +140,37 @@ class SDK {
     this._flushScheduled = false;
 
     ws.on("message", (rawData) => {
+      // Reject oversized messages before attempting to parse them.
+      if (rawData.length > MAX_MESSAGE_BYTES) {
+        console.warn(`Rejected oversized message (${rawData.length} bytes)`);
+        return;
+      }
+
+      let msg;
       try {
-        const msg = JSON.parse(rawData);
-        if (msg.type === "event") {
-          const component = this._registry.get(msg.id);
-          if (component) component._dispatch(msg.event, msg.payload ?? null);
-        }
+        msg = JSON.parse(rawData);
       } catch (err) {
         console.error("Failed to parse client message:", err);
+        return;
       }
+
+      // Validate that the incoming message is a plain object with expected
+      // fields before acting on it - guards against prototype-pollution and
+      // unexpected type coercions.
+      if (
+        msg === null ||
+        typeof msg !== "object" ||
+        Array.isArray(msg) ||
+        msg.type !== "event" ||
+        typeof msg.id !== "string" ||
+        typeof msg.event !== "string"
+      ) {
+        console.warn("Ignored malformed client message", msg?.type);
+        return;
+      }
+
+      const component = this._registry.get(msg.id);
+      if (component) component._dispatch(msg.event, msg.payload ?? null);
     });
   }
 
@@ -162,27 +198,35 @@ class SDK {
     this._flushScheduled = false;
     this._batchBuffer = [];
 
-    // Topological sort (post-order DFS) so children are created before parents.
-    const pending = this._pendingCreates.splice(0);
-    const pendingSet = new Set(pending);
-    const visited = new Set();
-    const sorted = [];
+    try {
+      // Topological sort (post-order DFS) so children are created before parents.
+      const pending = this._pendingCreates.splice(0);
+      const pendingSet = new Set(pending);
+      const visited = new Set();
+      const sorted = [];
 
-    const visit = (c) => {
-      if (visited.has(c.id)) return;
-      visited.add(c.id);
-      for (const child of c._children) {
-        if (pendingSet.has(child)) visit(child);
-      }
-      sorted.push(c);
-    };
+      const visit = (c) => {
+        if (visited.has(c.id)) return;
+        visited.add(c.id);
+        for (const child of c._children) {
+          if (pendingSet.has(child)) visit(child);
+        }
+        sorted.push(c);
+      };
 
-    for (const c of pending) visit(c);
-    for (const c of sorted) c._sendCreate();
+      for (const c of pending) visit(c);
+      for (const c of sorted) c._sendCreate();
 
-    // Run deferred callbacks (e.g. dynamic children updates on already-created components).
-    const callbacks = this._pendingCallbacks.splice(0);
-    for (const cb of callbacks) cb();
+      // Run deferred callbacks (e.g. dynamic children updates on already-created components).
+      const callbacks = this._pendingCallbacks.splice(0);
+      for (const cb of callbacks) cb();
+    } catch (err) {
+      // Ensure the batch buffer is always cleared even if an error occurs
+      // mid-flush, so the SDK does not block future flushes.
+      console.error("Error during SDK flush:", err);
+      this._batchBuffer = null;
+      return;
+    }
 
     // Emit all messages from this flush as a single atomic batch so the client
     // never renders intermediate states (e.g. newly created nodes with no parent).
