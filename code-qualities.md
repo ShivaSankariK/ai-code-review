@@ -18,6 +18,12 @@ Security is non-negotiable because failures are often silent and the blast radiu
 
 Each module should own one responsibility. Mixing application logic (the Todo app) with infrastructure (the SDK) in the same style-object soup makes both harder to change independently. Style constants, layout helpers, and business logic should each live in their own clearly bounded area so that a change in one does not silently break another.
 
+src/
+ components/    <-- UI rendering only
+ hooks/         <-- stateful React logic
+ utils/         <-- pure, framework-free helpers
+ types/         <-- shared type definitions
+
 ## 4. Resilience / Defensive Engineering
 
 Network-connected code must anticipate transient failures. A frontend that makes a single WebSocket connection and never retries will appear broken to users whenever the server restarts or a brief network hiccup occurs. Automatic reconnection with exponential back-off is the standard expectation for any persistent-connection UI.
